@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,6 +131,83 @@ func TestChooseWorker(t *testing.T) {
 					*gotWorker.VRAMFreeGiB,
 					test.wantWorkerID,
 				)
+			}
+		})
+	}
+}
+
+func TestScheduleWorker(t *testing.T) {
+	desktopWorker := Worker{
+		WorkerID:         "desktop",
+		GPU:              stringPtr("RTX 5070 Ti"),
+		VRAMGiB:          floatPtr(16),
+		VRAMFreeGiB:      floatPtr(14),
+		ComfyUIAvailable: true,
+		LastSeen:         time.Now(),
+	}
+	testWorkerMap := SafeWorkerMap{
+		workerMap: map[string]Worker{
+			desktopWorker.WorkerID: desktopWorker,
+		},
+	}
+	tests := []struct {
+		name           string
+		reqBody        string
+		wantStatusCode int
+		wantWorkerID   string
+	}{
+		{
+			name:           "returns 200 for happy path",
+			reqBody:        `{"required_vram_gib":4}`,
+			wantStatusCode: http.StatusOK,
+			wantWorkerID:   desktopWorker.WorkerID,
+		},
+		{
+			name:           "returns 503 if cannot find available worker",
+			reqBody:        `{"required_vram_gib":100}`,
+			wantStatusCode: http.StatusServiceUnavailable,
+		},
+		{
+			name:           "returns 400 for requiredVRAM value = 0",
+			reqBody:        `{"required_vram_gib":0}`,
+			wantStatusCode: http.StatusBadRequest,
+		},
+		{
+			name:           "returns 400 for requiredVRAM value < 0",
+			reqBody:        `{"required_vram_gib":-5}`,
+			wantStatusCode: http.StatusBadRequest,
+		},
+		{
+			name:           "returns 400 for malformed JSON",
+			reqBody:        `{not json}`,
+			wantStatusCode: http.StatusBadRequest,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/schedule",
+				strings.NewReader(test.reqBody),
+			)
+
+			testWorkerMap.ScheduleWorker(recorder, req)
+			if recorder.Code != test.wantStatusCode {
+				t.Fatalf("got status code %v, expected %v.", recorder.Code, test.wantStatusCode)
+			}
+			if recorder.Code == http.StatusOK {
+				var response ScheduleResponse
+				err := json.NewDecoder(recorder.Body).Decode(&response)
+				if err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+
+				if response.Worker.WorkerID != test.wantWorkerID {
+					t.Fatalf("got workerID %v, expected %v.", response.Worker.WorkerID, test.wantWorkerID)
+				}
 			}
 		})
 	}

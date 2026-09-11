@@ -40,6 +40,14 @@ type ListWorkersResponse struct {
 	Workers []WorkerStatus `json:"workers"`
 }
 
+type ScheduleRequest struct {
+	RequiredVRAMGiB float64 `json:"required_vram_gib"`
+}
+
+type ScheduleResponse struct {
+	Worker Worker `json:"worker"`
+}
+
 func (w Worker) IsOnline() bool {
 	return time.Since(w.LastSeen) < offlineTime
 }
@@ -145,7 +153,7 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 	}
 }
 
-func (wMap *SafeWorkerMap) chooseWorker(requiredVram float64) (Worker, bool) {
+func (wMap *SafeWorkerMap) chooseWorker(requiredVRAM float64) (Worker, bool) {
 	wMap.mu.RLock()
 	defer wMap.mu.RUnlock()
 	var chosenWorker Worker
@@ -156,7 +164,7 @@ func (wMap *SafeWorkerMap) chooseWorker(requiredVram float64) (Worker, bool) {
 			continue
 		}
 
-		if worker.VRAMFreeGiB == nil || *worker.VRAMFreeGiB < requiredVram {
+		if worker.VRAMFreeGiB == nil || *worker.VRAMFreeGiB < requiredVRAM {
 			continue
 		}
 
@@ -169,6 +177,41 @@ func (wMap *SafeWorkerMap) chooseWorker(requiredVram float64) (Worker, bool) {
 	}
 
 	return chosenWorker, foundWorker
+}
+
+func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var scheduleReq ScheduleRequest
+	err := json.NewDecoder(req.Body).Decode(&scheduleReq)
+	if err != nil {
+		log.Printf("Unable to decode Schedule request to JSON. %v\n", err)
+		http.Error(w, "Bad Request Error", http.StatusBadRequest)
+		return
+	}
+
+	if scheduleReq.RequiredVRAMGiB <= 0 {
+		log.Printf("Unable to process Schedule request with RequiredVRAMGiB < 0. %v\n", err)
+		http.Error(w, "RequiredVRAMGiB must be greater than 0", http.StatusBadRequest)
+		return
+	}
+
+	worker, hasWorker := wMap.chooseWorker(scheduleReq.RequiredVRAMGiB)
+	if !hasWorker {
+		log.Printf("Unable to find available worker for requested free VRAM %v", scheduleReq.RequiredVRAMGiB)
+		http.Error(w, "Unable to find available worker.", http.StatusServiceUnavailable)
+		return
+	}
+
+	resp := ScheduleResponse{
+		Worker: worker,
+	}
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		log.Printf("Unable to encode Schedule response to JSON. %v\n", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func readAndValidateEnvValues() {
@@ -196,6 +239,7 @@ func main() {
 	http.HandleFunc("GET /workers", safeWorkerMap.ListWorkers)
 	http.HandleFunc("GET /workers/{id}", safeWorkerMap.GetWorker)
 	http.HandleFunc("POST /workers/register", safeWorkerMap.RegisterWorker)
+	http.HandleFunc("POST /schedule", safeWorkerMap.ScheduleWorker)
 
 	err := http.ListenAndServe(":"+myEnv["CONTROL_PLANE_PORT"], nil)
 	if err != nil {
