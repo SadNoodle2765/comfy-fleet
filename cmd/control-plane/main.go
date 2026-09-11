@@ -11,11 +11,11 @@ import (
 )
 
 type Worker struct {
-	WorkerID         string  `json:"worker_id"`
-	GPU              string  `json:"gpu"`
-	VRAMGiB          float64 `json:"vram_gib"`
-	VRAMFreeGiB      float64 `json:"vram_free_gib"`
-	ComfyUIAvailable bool    `json:"comfyui_available"`
+	WorkerID         string   `json:"worker_id"`
+	GPU              *string  `json:"gpu"`
+	VRAMGiB          *float64 `json:"vram_gib"`
+	VRAMFreeGiB      *float64 `json:"vram_free_gib"`
+	ComfyUIAvailable bool     `json:"comfyui_available"`
 }
 
 type SafeWorkerMap struct {
