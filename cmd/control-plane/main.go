@@ -145,6 +145,32 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 	}
 }
 
+func (wMap *SafeWorkerMap) chooseWorker(requiredVram float64) (Worker, bool) {
+	wMap.mu.RLock()
+	defer wMap.mu.RUnlock()
+	var chosenWorker Worker
+	foundWorker := false
+
+	for _, worker := range wMap.workerMap {
+		if !worker.IsOnline() || !worker.ComfyUIAvailable {
+			continue
+		}
+
+		if worker.VRAMFreeGiB == nil || *worker.VRAMFreeGiB < requiredVram {
+			continue
+		}
+
+		if foundWorker && *chosenWorker.VRAMFreeGiB >= *worker.VRAMFreeGiB {
+			continue
+		}
+
+		foundWorker = true
+		chosenWorker = worker
+	}
+
+	return chosenWorker, foundWorker
+}
+
 func readAndValidateEnvValues() {
 	var err error
 	myEnv, err = godotenv.Read()
