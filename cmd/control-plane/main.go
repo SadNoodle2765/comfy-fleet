@@ -8,14 +8,23 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"time"
 )
 
+const offlineTime = 30 * time.Second
+
 type Worker struct {
-	WorkerID         string   `json:"worker_id"`
-	GPU              *string  `json:"gpu"`
-	VRAMGiB          *float64 `json:"vram_gib"`
-	VRAMFreeGiB      *float64 `json:"vram_free_gib"`
-	ComfyUIAvailable bool     `json:"comfyui_available"`
+	WorkerID         string    `json:"worker_id"`
+	GPU              *string   `json:"gpu"`
+	VRAMGiB          *float64  `json:"vram_gib"`
+	VRAMFreeGiB      *float64  `json:"vram_free_gib"`
+	ComfyUIAvailable bool      `json:"comfyui_available"`
+	LastSeen         time.Time `json:"last_seen"`
+}
+
+type WorkerStatus struct {
+	Worker Worker `json:"worker"`
+	Online bool   `json:"online"`
 }
 
 type SafeWorkerMap struct {
@@ -23,12 +32,12 @@ type SafeWorkerMap struct {
 	workerMap map[string]Worker
 }
 
-type GetWorkerResponse struct {
-	Worker Worker `json:"worker"`
+type ListWorkersResponse struct {
+	Workers []WorkerStatus `json:"workers"`
 }
 
-type ListWorkersResponse struct {
-	Workers []Worker `json:"workers"`
+func (w Worker) IsOnline() bool {
+	return time.Since(w.LastSeen) < offlineTime
 }
 
 func (wMap *SafeWorkerMap) Get(workerID string) (Worker, bool) {
@@ -63,8 +72,9 @@ func (wMap *SafeWorkerMap) GetWorker(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	resp := GetWorkerResponse{
+	resp := WorkerStatus{
 		Worker: worker,
+		Online: worker.IsOnline(),
 	}
 
 	err := json.NewEncoder(w).Encode(resp)
@@ -84,8 +94,18 @@ func (wMap *SafeWorkerMap) ListWorkers(w http.ResponseWriter, req *http.Request)
 	slices.SortFunc(workers, func(a, b Worker) int {
 		return cmp.Compare(a.WorkerID, b.WorkerID)
 	})
+
+	workerStatuses := []WorkerStatus{}
+
+	for _, w := range workers {
+		workerStatuses = append(workerStatuses, WorkerStatus{
+			Worker: w,
+			Online: w.IsOnline(),
+		})
+	}
+
 	resp := ListWorkersResponse{
-		Workers: workers,
+		Workers: workerStatuses,
 	}
 
 	err := json.NewEncoder(w).Encode(resp)
@@ -110,6 +130,8 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 		http.Error(w, "Cannot register worker with empty WorkerID", http.StatusBadRequest)
 		return
 	}
+
+	newWorker.LastSeen = time.Now()
 
 	workerExists := wMap.Put(newWorker)
 	if workerExists {
