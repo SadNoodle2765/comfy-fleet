@@ -9,7 +9,11 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
 )
+
+var myEnv map[string]string
 
 const offlineTime = 30 * time.Second
 
@@ -141,7 +145,24 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 	}
 }
 
+func readAndValidateEnvValues() {
+	var err error
+	myEnv, err = godotenv.Read()
+	if err != nil {
+		log.Fatalf("No .env file found. %v", err)
+	}
+
+	requiredEnvKeys := []string{"CONTROL_PLANE_PORT"}
+	for _, key := range requiredEnvKeys {
+		if val, ok := myEnv[key]; !ok || val == "" {
+			log.Fatalf("Missing required env value for %v.", key)
+		}
+	}
+}
+
 func main() {
+	readAndValidateEnvValues()
+
 	safeWorkerMap := SafeWorkerMap{
 		workerMap: make(map[string]Worker),
 	}
@@ -150,8 +171,8 @@ func main() {
 	http.HandleFunc("GET /workers/{id}", safeWorkerMap.GetWorker)
 	http.HandleFunc("POST /workers/register", safeWorkerMap.RegisterWorker)
 
-	err := http.ListenAndServe(":8080", nil)
+	err := http.ListenAndServe(":"+myEnv["CONTROL_PLANE_PORT"], nil)
 	if err != nil {
-		log.Fatalf("Failed to start server on port 8080. %v", err)
+		log.Fatalf("Failed to start server on port %v. %v", myEnv["CONTROL_PLANE_PORT"], err)
 	}
 }

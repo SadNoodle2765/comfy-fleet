@@ -9,12 +9,13 @@ import (
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
+var myEnv map[string]string
+
 const bytesPerGiB = (1 << 30)
-const testWorkerID = "desktop-5070ti"
-const controlPlaneIP = "http://10.0.0.57:8080"
-const localhostIP = "http://localhost:8188"
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
@@ -76,7 +77,7 @@ func registerToControlPlane(workerID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, controlPlaneIP+"/workers/register", bytes.NewReader(reqJson))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, myEnv["CONTROL_PLANE_URL"]+"/workers/register", bytes.NewReader(reqJson))
 	if err != nil {
 		log.Printf("Failed to create register worker POST request: %v\n", err)
 		return
@@ -103,7 +104,11 @@ func registerToControlPlane(workerID string) {
 	case http.StatusCreated:
 		log.Printf("Worker %v registered successfully.\n", workerID)
 	default:
-		log.Printf("Worker %v registration failed. Status: %v. %v", workerID, resp.StatusCode, body)
+		log.Printf("Worker %v registration failed. Status: %v. %s",
+			workerID,
+			resp.StatusCode,
+			body,
+		)
 	}
 }
 
@@ -125,7 +130,7 @@ func getComfyUISystemStats() *ComfyUISystemStats {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, localhostIP+"/system_stats", nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, myEnv["COMFYUI_URL"]+"/system_stats", nil)
 	if err != nil {
 		log.Printf("Failed to create system_stats GET request: %v\n", err)
 		return nil
@@ -192,7 +197,7 @@ func capabilities(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	systemStats := getComfyUISystemStats()
-	capabilitiesResponse := systemStats.toCapabilities(testWorkerID)
+	capabilitiesResponse := systemStats.toCapabilities(myEnv["WORKER_ID"])
 
 	err := json.NewEncoder(w).Encode(capabilitiesResponse)
 	if err != nil {
@@ -201,14 +206,31 @@ func capabilities(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func readAndValidateEnvValues() {
+	var err error
+	myEnv, err = godotenv.Read()
+	if err != nil {
+		log.Fatalf("No .env file found. %v", err)
+	}
+
+	requiredEnvKeys := []string{"WORKER_ID", "WORKER_PORT", "CONTROL_PLANE_URL", "COMFYUI_URL"}
+	for _, key := range requiredEnvKeys {
+		if val, ok := myEnv[key]; !ok || val == "" {
+			log.Fatalf("Missing required env value for %v.", key)
+		}
+	}
+}
+
 func main() {
-	go registerToControlPlaneHeartbeat(testWorkerID)
+	readAndValidateEnvValues()
+
+	go registerToControlPlaneHeartbeat(myEnv["WORKER_ID"])
 
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/capabilities", capabilities)
 
-	err := http.ListenAndServe(":9000", nil)
+	err := http.ListenAndServe(":"+myEnv["WORKER_PORT"], nil)
 	if err != nil {
-		log.Fatalf("Failed to start server on port 9000. %v", err)
+		log.Fatalf("Failed to start server on port %v. %v", myEnv["WORKER_PORT"], err)
 	}
 }
