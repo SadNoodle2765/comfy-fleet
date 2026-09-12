@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"log"
 	"maps"
@@ -15,10 +16,15 @@ import (
 
 var myEnv map[string]string
 
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
 const offlineTime = 30 * time.Second
 
 type Worker struct {
 	WorkerID         string    `json:"worker_id"`
+	URL              string    `json:"url"`
 	GPU              *string   `json:"gpu"`
 	VRAMGiB          *float64  `json:"vram_gib"`
 	VRAMFreeGiB      *float64  `json:"vram_free_gib"`
@@ -153,11 +159,10 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 	}
 }
 
-func (wMap *SafeWorkerMap) chooseWorker(requiredVRAM float64) (Worker, bool) {
+func (wMap *SafeWorkerMap) eligibleWorkers(requiredVRAM float64) []Worker {
 	wMap.mu.RLock()
 	defer wMap.mu.RUnlock()
-	var chosenWorker Worker
-	foundWorker := false
+	var eligibleWorkers []Worker
 
 	for _, worker := range wMap.workerMap {
 		if !worker.IsOnline() || !worker.ComfyUIAvailable {
@@ -168,15 +173,39 @@ func (wMap *SafeWorkerMap) chooseWorker(requiredVRAM float64) (Worker, bool) {
 			continue
 		}
 
-		if foundWorker && *chosenWorker.VRAMFreeGiB >= *worker.VRAMFreeGiB {
-			continue
-		}
-
-		foundWorker = true
-		chosenWorker = worker
+		eligibleWorkers = append(eligibleWorkers, worker)
 	}
 
-	return chosenWorker, foundWorker
+	slices.SortFunc(eligibleWorkers, func(a, b Worker) int {
+		return cmp.Compare(*b.VRAMFreeGiB, *a.VRAMFreeGiB)
+	})
+
+	return eligibleWorkers
+}
+
+func (worker Worker) SendJob() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, worker.URL+"/jobs", nil)
+	if err != nil {
+		log.Printf("Failed to create jobs POST request: %v\n", err)
+		return false
+	}
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("Failed to POST jobs for worker %v. %v\n", worker.WorkerID, err)
+		return false
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Worker %v did not accept job.\n", worker.WorkerID)
+		return false
+	}
+
+	return true
 }
 
 func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Request) {
@@ -195,15 +224,33 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	worker, hasWorker := wMap.chooseWorker(scheduleReq.RequiredVRAMGiB)
-	if !hasWorker {
+	eligibleWorkers := wMap.eligibleWorkers(scheduleReq.RequiredVRAMGiB)
+	if len(eligibleWorkers) == 0 {
 		log.Printf("Unable to find available worker for requested free VRAM %v", scheduleReq.RequiredVRAMGiB)
 		http.Error(w, "Unable to find available worker.", http.StatusServiceUnavailable)
 		return
 	}
 
+	var chosenWorker Worker
+	workerAccepted := false
+
+	for _, worker := range eligibleWorkers {
+		accepted := worker.SendJob()
+		if accepted {
+			chosenWorker = worker
+			workerAccepted = true
+			break
+		}
+	}
+
+	if !workerAccepted {
+		log.Println("No eligible worker accepted job.")
+		http.Error(w, "Unable to find available worker.", http.StatusServiceUnavailable)
+		return
+	}
+
 	resp := ScheduleResponse{
-		Worker: worker,
+		Worker: chosenWorker,
 	}
 
 	err = json.NewEncoder(w).Encode(resp)

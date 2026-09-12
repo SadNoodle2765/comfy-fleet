@@ -27,14 +27,16 @@ type HealthResponse struct {
 
 type WorkerCapabilities struct {
 	WorkerID         string   `json:"worker_id"`
+	URL              string   `json:"url"`
 	GPU              *string  `json:"gpu"`
 	VRAMGiB          *float64 `json:"vram_gib"`
 	VRAMFreeGiB      *float64 `json:"vram_free_gib"`
 	ComfyUIAvailable bool     `json:"comfyui_available"`
 }
 
-type CapabilitiesResponse = WorkerCapabilities
-type RegisterWorkerRequest = WorkerCapabilities
+type ReceiveJobResponse struct {
+	Status string `json:"status"`
+}
 
 type ComfyUISystemStats struct {
 	Devices []Device `json:"devices"`
@@ -58,17 +60,10 @@ func handleJSONError(w http.ResponseWriter, err error) {
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 }
 
-func registerToControlPlane(workerID string) {
-	cap := getComfyUISystemStats().toCapabilities(workerID)
-	req := RegisterWorkerRequest{
-		WorkerID:         cap.WorkerID,
-		GPU:              cap.GPU,
-		VRAMGiB:          cap.VRAMGiB,
-		VRAMFreeGiB:      cap.VRAMFreeGiB,
-		ComfyUIAvailable: cap.ComfyUIAvailable,
-	}
+func registerToControlPlane() {
+	cap := getComfyUISystemStats().toCapabilities()
 
-	reqJson, err := json.Marshal(req)
+	reqJson, err := json.Marshal(cap)
 	if err != nil {
 		log.Printf("Failed to marshal register worker request to JSON. %v", err)
 		return
@@ -100,29 +95,29 @@ func registerToControlPlane(workerID string) {
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		log.Printf("Worker %v updated successfully.\n", workerID)
+		log.Printf("Worker %v updated successfully.\n", myEnv["WORKER_ID"])
 	case http.StatusCreated:
-		log.Printf("Worker %v registered successfully.\n", workerID)
+		log.Printf("Worker %v registered successfully.\n", myEnv["WORKER_ID"])
 	default:
 		log.Printf("Worker %v registration failed. Status: %v. %s",
-			workerID,
+			myEnv["WORKER_ID"],
 			resp.StatusCode,
 			body,
 		)
 	}
 }
 
-func registerToControlPlaneHeartbeat(workerID string) {
+func registerToControlPlaneHeartbeat() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	registerToControlPlane(workerID)
+	registerToControlPlane()
 	log.Println("Initial register worker call.")
 
 	for {
 		t := <-ticker.C
 		log.Printf("Register worker heartbeat tick at %v.\n", t)
-		registerToControlPlane(workerID)
+		registerToControlPlane()
 	}
 }
 
@@ -159,9 +154,10 @@ func getComfyUISystemStats() *ComfyUISystemStats {
 	return &systemStats
 }
 
-func (systemStats *ComfyUISystemStats) toCapabilities(workerID string) CapabilitiesResponse {
-	resp := CapabilitiesResponse{
-		WorkerID:         workerID,
+func (systemStats *ComfyUISystemStats) toCapabilities() WorkerCapabilities {
+	resp := WorkerCapabilities{
+		WorkerID:         myEnv["WORKER_ID"],
+		URL:              myEnv["WORKER_URL"],
 		GPU:              nil,
 		VRAMGiB:          nil,
 		VRAMFreeGiB:      nil,
@@ -197,9 +193,22 @@ func capabilities(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	systemStats := getComfyUISystemStats()
-	capabilitiesResponse := systemStats.toCapabilities(myEnv["WORKER_ID"])
+	capabilitiesResponse := systemStats.toCapabilities()
 
 	err := json.NewEncoder(w).Encode(capabilitiesResponse)
+	if err != nil {
+		handleJSONError(w, err)
+		return
+	}
+}
+
+func receiveJob(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	jobResponse := ReceiveJobResponse{
+		Status: "accepted",
+	}
+
+	err := json.NewEncoder(w).Encode(jobResponse)
 	if err != nil {
 		handleJSONError(w, err)
 		return
@@ -213,7 +222,7 @@ func readAndValidateEnvValues() {
 		log.Fatalf("No .env file found. %v", err)
 	}
 
-	requiredEnvKeys := []string{"WORKER_ID", "WORKER_PORT", "CONTROL_PLANE_URL", "COMFYUI_URL"}
+	requiredEnvKeys := []string{"WORKER_ID", "WORKER_PORT", "WORKER_URL", "CONTROL_PLANE_URL", "COMFYUI_URL"}
 	for _, key := range requiredEnvKeys {
 		if val, ok := myEnv[key]; !ok || val == "" {
 			log.Fatalf("Missing required env value for %v.", key)
@@ -224,10 +233,11 @@ func readAndValidateEnvValues() {
 func main() {
 	readAndValidateEnvValues()
 
-	go registerToControlPlaneHeartbeat(myEnv["WORKER_ID"])
+	go registerToControlPlaneHeartbeat()
 
-	http.HandleFunc("/health", health)
-	http.HandleFunc("/capabilities", capabilities)
+	http.HandleFunc("GET /health", health)
+	http.HandleFunc("GET /capabilities", capabilities)
+	http.HandleFunc("POST /jobs", receiveJob)
 
 	err := http.ListenAndServe(":"+myEnv["WORKER_PORT"], nil)
 	if err != nil {
