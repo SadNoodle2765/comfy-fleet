@@ -45,7 +45,8 @@ type SafeWorkerMap struct {
 }
 
 type Job struct {
-	ID string `json:"job_id"`
+	ID     string         `json:"job_id"`
+	Prompt map[string]any `json:"prompt"`
 }
 
 type ListWorkersResponse struct {
@@ -53,17 +54,20 @@ type ListWorkersResponse struct {
 }
 
 type ScheduleRequest struct {
-	RequiredVRAMGiB float64 `json:"required_vram_gib"`
+	RequiredVRAMGiB float64        `json:"required_vram_gib"`
+	Prompt          map[string]any `json:"prompt"`
 }
 
 type ScheduleResponse struct {
-	JobID  string `json:"job_id"`
-	Worker Worker `json:"worker"`
+	JobID    string `json:"job_id"`
+	PromptID string `json:"prompt_id"`
+	Worker   Worker `json:"worker"`
 }
 
 type SendJobResponse struct {
-	JobID  string `json:"job_id"`
-	Status string `json:"status"`
+	JobID    string `json:"job_id"`
+	PromptID string `json:"prompt_id"`
+	Status   string `json:"status"`
 }
 
 func (w Worker) IsOnline() bool {
@@ -195,53 +199,58 @@ func (wMap *SafeWorkerMap) eligibleWorkers(requiredVRAM float64) []Worker {
 	return eligibleWorkers
 }
 
-func (worker Worker) SendJob(job Job) bool {
+// Returns PromptID
+func (worker Worker) SendJob(job Job) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	jobJson, err := json.Marshal(job)
 	if err != nil {
 		log.Printf("Failed to marshal job %v to JSON. %v", job, err)
-		return false
+		return ""
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, worker.URL+"/jobs", bytes.NewReader(jobJson))
+	if err != nil {
+		log.Printf("Failed to create HTTP send job request.%v\n", err)
+		return ""
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if err != nil {
 		log.Printf("Failed to create jobs POST request with %v: %v\n", jobJson, err)
-		return false
+		return ""
 	}
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		log.Printf("Failed to POST jobs for worker %v. %v\n", worker.WorkerID, err)
-		return false
+		return ""
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Worker %v did not return good status code. Status: %v.\n", worker.WorkerID, resp.StatusCode)
-		return false
+		return ""
 	}
 
 	var sendJobResp SendJobResponse
 	err = json.NewDecoder(resp.Body).Decode(&sendJobResp)
 	if err != nil {
 		log.Printf("Unable to decode sendJob response from JSON. %v\n", err)
-		return false
+		return ""
 	}
 
 	if sendJobResp.JobID != job.ID {
 		log.Printf("Job ID returned from worker %v is different from job that was sent. Sent JobID: %v, recevied JobID: %v.\n", worker.WorkerID, job.ID, sendJobResp.JobID)
-		return false
+		return ""
 	}
 
 	if sendJobResp.Status != "accepted" {
 		log.Printf("Sent job %v to worker %v, but received status '%v'. Expected 'accepted'.\n", job.ID, worker.WorkerID, sendJobResp.Status)
-		return false
+		return ""
 	}
 
-	return true
+	return sendJobResp.PromptID
 }
 
 func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Request) {
@@ -268,30 +277,31 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 	}
 
 	var chosenWorker Worker
-	workerAccepted := false
+	promptID := ""
 
 	job := Job{
-		ID: uuid.NewString(),
+		ID:     uuid.NewString(),
+		Prompt: scheduleReq.Prompt,
 	}
 
 	for _, worker := range eligibleWorkers {
-		accepted := worker.SendJob(job)
-		if accepted {
+		promptID = worker.SendJob(job)
+		if promptID != "" {
 			chosenWorker = worker
-			workerAccepted = true
 			break
 		}
 	}
 
-	if !workerAccepted {
+	if promptID == "" {
 		log.Println("No eligible worker accepted job.")
 		http.Error(w, "Unable to find available worker.", http.StatusServiceUnavailable)
 		return
 	}
 
 	resp := ScheduleResponse{
-		JobID:  job.ID,
-		Worker: chosenWorker,
+		JobID:    job.ID,
+		PromptID: promptID,
+		Worker:   chosenWorker,
 	}
 
 	err = json.NewEncoder(w).Encode(resp)

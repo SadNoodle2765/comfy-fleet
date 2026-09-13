@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -35,12 +37,24 @@ type WorkerCapabilities struct {
 }
 
 type ReceiveJobRequest struct {
-	JobID string `json:"job_id"`
+	JobID  string         `json:"job_id"`
+	Prompt map[string]any `json:"prompt"`
 }
 
 type ReceiveJobResponse struct {
-	JobID  string `json:"job_id"`
-	Status string `json:"status"`
+	JobID    string `json:"job_id"`
+	PromptID string `json:"prompt_id"`
+	Status   string `json:"status"`
+}
+
+type PromptComfyUIRequest struct {
+	Prompt map[string]any `json:"prompt"`
+}
+
+type PromptComfyUIResponse struct {
+	PromptID   string         `json:"prompt_id"`
+	Number     int            `json:"number"`
+	NodeErrors map[string]any `json:"node_errors"`
 }
 
 type ComfyUISystemStats struct {
@@ -227,9 +241,29 @@ func receiveJob(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if len(jobRequest.Prompt) == 0 {
+		log.Println("Reject job request with empty prompt.")
+		http.Error(w, "Cannot process job with empty prompt.", http.StatusBadRequest)
+		return
+	}
+
+	promptResponse, err := sendPromptToComfyUI(jobRequest.Prompt)
+	if err != nil {
+		log.Printf("Failed sending prompt to ComfyUI. %v\n", err)
+		http.Error(w, "Failed sending prompt to ComfyUI.", http.StatusInternalServerError)
+		return
+	}
+
+	if promptResponse.PromptID == "" {
+		log.Printf("Got empty prompt_id from ComfyUI. %v\n", err)
+		http.Error(w, "Got empty prompt_id from ComfyUI.", http.StatusInternalServerError)
+		return
+	}
+
 	jobResponse := ReceiveJobResponse{
-		JobID:  jobRequest.JobID,
-		Status: "accepted",
+		JobID:    jobRequest.JobID,
+		PromptID: promptResponse.PromptID,
+		Status:   "accepted",
 	}
 
 	err = json.NewEncoder(w).Encode(jobResponse)
@@ -237,6 +271,55 @@ func receiveJob(w http.ResponseWriter, req *http.Request) {
 		handleJSONErrorInternal(w, err)
 		return
 	}
+}
+
+func sendPromptToComfyUI(prompt map[string]any) (PromptComfyUIResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	reqBody := PromptComfyUIRequest{
+		Prompt: prompt,
+	}
+
+	reqBodyJson, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Printf("Failed to marshal prompt %v to JSON. %v", reqBody, err)
+		return PromptComfyUIResponse{}, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		myEnv["COMFYUI_URL"]+"/prompt",
+		bytes.NewReader(reqBodyJson),
+	)
+	if err != nil {
+		log.Printf("Failed to create prompt ComfyUI POST request: %v\n", err)
+		return PromptComfyUIResponse{}, err
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("Could not connect to ComfyUI. %v\n", err)
+		return PromptComfyUIResponse{}, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("API returned bad status code. %d. Response Body: %v.\n", resp.StatusCode, resp.Body)
+		return PromptComfyUIResponse{}, fmt.Errorf("API returned bad status code. %d\n", resp.StatusCode)
+	}
+
+	var promptResponse PromptComfyUIResponse
+	err = json.NewDecoder(resp.Body).Decode(&promptResponse)
+	if err != nil {
+		log.Printf("Unable to parse prompt response returned by ComfyUI. %v\n", err)
+		return PromptComfyUIResponse{}, err
+	}
+
+	return promptResponse, nil
 }
 
 func readAndValidateEnvValues() {
@@ -254,7 +337,26 @@ func readAndValidateEnvValues() {
 	}
 }
 
+func setLogFile() *os.File {
+	logFile, err := os.OpenFile(
+		"worker.log",
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+		0644,
+	)
+
+	if err != nil {
+		log.Fatalf("failed to open worker.log: %v", err)
+	}
+
+	log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+
+	return logFile
+}
+
 func main() {
+	logFile := setLogFile()
+	defer logFile.Close()
+
 	readAndValidateEnvValues()
 
 	go registerToControlPlaneHeartbeat()
