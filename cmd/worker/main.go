@@ -34,7 +34,12 @@ type WorkerCapabilities struct {
 	ComfyUIAvailable bool     `json:"comfyui_available"`
 }
 
+type ReceiveJobRequest struct {
+	JobID string `json:"job_id"`
+}
+
 type ReceiveJobResponse struct {
+	JobID  string `json:"job_id"`
 	Status string `json:"status"`
 }
 
@@ -55,9 +60,14 @@ func bytesToGiB(bytes int) float64 {
 	return math.Round(gib*100) / 100
 }
 
-func handleJSONError(w http.ResponseWriter, err error) {
+func handleJSONErrorInternal(w http.ResponseWriter, err error) {
 	log.Printf("Error while handling JSON: %s\n", err)
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+}
+
+func handleJSONErrorExternal(w http.ResponseWriter, err error) {
+	log.Printf("Error while handling JSON: %s\n", err)
+	http.Error(w, "Bad Request Error", http.StatusBadRequest)
 }
 
 func registerToControlPlane() {
@@ -184,7 +194,7 @@ func health(w http.ResponseWriter, req *http.Request) {
 
 	err := json.NewEncoder(w).Encode(goodHealth)
 	if err != nil {
-		handleJSONError(w, err)
+		handleJSONErrorInternal(w, err)
 		return
 	}
 }
@@ -197,20 +207,34 @@ func capabilities(w http.ResponseWriter, req *http.Request) {
 
 	err := json.NewEncoder(w).Encode(capabilitiesResponse)
 	if err != nil {
-		handleJSONError(w, err)
+		handleJSONErrorInternal(w, err)
 		return
 	}
 }
 
-func receiveJob(w http.ResponseWriter, _ *http.Request) {
+func receiveJob(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	var jobRequest ReceiveJobRequest
+	err := json.NewDecoder(req.Body).Decode(&jobRequest)
+	if err != nil {
+		handleJSONErrorExternal(w, err)
+		return
+	}
+	if jobRequest.JobID == "" {
+		log.Println("Reject job request with empty job ID.")
+		http.Error(w, "Cannot process job with empty job ID.", http.StatusBadRequest)
+		return
+	}
+
 	jobResponse := ReceiveJobResponse{
+		JobID:  jobRequest.JobID,
 		Status: "accepted",
 	}
 
-	err := json.NewEncoder(w).Encode(jobResponse)
+	err = json.NewEncoder(w).Encode(jobResponse)
 	if err != nil {
-		handleJSONError(w, err)
+		handleJSONErrorInternal(w, err)
 		return
 	}
 }

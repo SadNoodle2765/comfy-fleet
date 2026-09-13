@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 )
 
@@ -42,6 +44,10 @@ type SafeWorkerMap struct {
 	workerMap map[string]Worker
 }
 
+type Job struct {
+	ID string `json:"job_id"`
+}
+
 type ListWorkersResponse struct {
 	Workers []WorkerStatus `json:"workers"`
 }
@@ -51,7 +57,13 @@ type ScheduleRequest struct {
 }
 
 type ScheduleResponse struct {
+	JobID  string `json:"job_id"`
 	Worker Worker `json:"worker"`
+}
+
+type SendJobResponse struct {
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
 }
 
 func (w Worker) IsOnline() bool {
@@ -183,13 +195,20 @@ func (wMap *SafeWorkerMap) eligibleWorkers(requiredVRAM float64) []Worker {
 	return eligibleWorkers
 }
 
-func (worker Worker) SendJob() bool {
+func (worker Worker) SendJob(job Job) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, worker.URL+"/jobs", nil)
+	jobJson, err := json.Marshal(job)
 	if err != nil {
-		log.Printf("Failed to create jobs POST request: %v\n", err)
+		log.Printf("Failed to marshal job %v to JSON. %v", job, err)
+		return false
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, worker.URL+"/jobs", bytes.NewReader(jobJson))
+	httpReq.Header.Set("Content-Type", "application/json")
+	if err != nil {
+		log.Printf("Failed to create jobs POST request with %v: %v\n", jobJson, err)
 		return false
 	}
 	resp, err := httpClient.Do(httpReq)
@@ -201,7 +220,24 @@ func (worker Worker) SendJob() bool {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Worker %v did not accept job.\n", worker.WorkerID)
+		log.Printf("Worker %v did not return good status code. Status: %v.\n", worker.WorkerID, resp.StatusCode)
+		return false
+	}
+
+	var sendJobResp SendJobResponse
+	err = json.NewDecoder(resp.Body).Decode(&sendJobResp)
+	if err != nil {
+		log.Printf("Unable to decode sendJob response from JSON. %v\n", err)
+		return false
+	}
+
+	if sendJobResp.JobID != job.ID {
+		log.Printf("Job ID returned from worker %v is different from job that was sent. Sent JobID: %v, recevied JobID: %v.\n", worker.WorkerID, job.ID, sendJobResp.JobID)
+		return false
+	}
+
+	if sendJobResp.Status != "accepted" {
+		log.Printf("Sent job %v to worker %v, but received status '%v'. Expected 'accepted'.\n", job.ID, worker.WorkerID, sendJobResp.Status)
 		return false
 	}
 
@@ -213,13 +249,13 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 	var scheduleReq ScheduleRequest
 	err := json.NewDecoder(req.Body).Decode(&scheduleReq)
 	if err != nil {
-		log.Printf("Unable to decode Schedule request to JSON. %v\n", err)
+		log.Printf("Unable to decode Schedule request from JSON. %v\n", err)
 		http.Error(w, "Bad Request Error", http.StatusBadRequest)
 		return
 	}
 
 	if scheduleReq.RequiredVRAMGiB <= 0 {
-		log.Printf("Unable to process Schedule request with RequiredVRAMGiB < 0. %v\n", err)
+		log.Println("Unable to process Schedule request with RequiredVRAMGiB <= 0.")
 		http.Error(w, "RequiredVRAMGiB must be greater than 0", http.StatusBadRequest)
 		return
 	}
@@ -234,8 +270,12 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 	var chosenWorker Worker
 	workerAccepted := false
 
+	job := Job{
+		ID: uuid.NewString(),
+	}
+
 	for _, worker := range eligibleWorkers {
-		accepted := worker.SendJob()
+		accepted := worker.SendJob(job)
 		if accepted {
 			chosenWorker = worker
 			workerAccepted = true
@@ -250,6 +290,7 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 	}
 
 	resp := ScheduleResponse{
+		JobID:  job.ID,
 		Worker: chosenWorker,
 	}
 

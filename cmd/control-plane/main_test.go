@@ -124,8 +124,8 @@ func TestEligibleWorkers(t *testing.T) {
 	}
 }
 
-func TestScheduleWorker(t *testing.T) {
-	goodWorkerServer := httptest.NewServer(http.HandlerFunc(
+func createScheduleWorkerTestWorkerServer(t *testing.T, status string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/jobs" {
 				t.Fatalf("unexpected path %s", r.URL.Path)
@@ -135,8 +135,27 @@ func TestScheduleWorker(t *testing.T) {
 				t.Fatalf("unexpected method %s", r.Method)
 			}
 
-			w.WriteHeader(http.StatusOK)
+			var job Job
+			err := json.NewDecoder(r.Body).Decode(&job)
+			if err != nil {
+				t.Fatalf("failed to decode Job. %v", err)
+			}
+
+			resp := SendJobResponse{
+				JobID:  job.ID,
+				Status: status,
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			err = json.NewEncoder(w).Encode(resp)
+			if err != nil {
+				t.Fatalf("failed to encode SendJobResponse %v to JSON.", resp)
+			}
 		}))
+}
+
+func TestScheduleWorker(t *testing.T) {
+	goodWorkerServer := createScheduleWorkerTestWorkerServer(t, "accepted")
 	defer goodWorkerServer.Close()
 
 	badWorkerServer := httptest.NewServer(http.HandlerFunc(
@@ -261,4 +280,98 @@ func TestScheduleWorker(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("jobID should stay the same across worker SendJob requests", func(t *testing.T) {
+		firstJobID := make(chan string, 1)
+		secondJobID := make(chan string, 1)
+
+		rejectServer := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				var job Job
+				if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+					t.Fatalf("failed to decode job: %v", err)
+				}
+
+				firstJobID <- job.ID
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(SendJobResponse{
+					JobID:  job.ID,
+					Status: "rejected",
+				})
+			},
+		))
+		defer rejectServer.Close()
+
+		acceptServer := httptest.NewServer(http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+				var job Job
+				if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+					t.Fatalf("failed to decode job: %v", err)
+				}
+
+				secondJobID <- job.ID
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(SendJobResponse{
+					JobID:  job.ID,
+					Status: "accepted",
+				})
+			},
+		))
+		defer acceptServer.Close()
+
+		rejectWorker := desktopWorker
+		rejectWorker.WorkerID = "reject-worker"
+		rejectWorker.URL = rejectServer.URL
+		rejectWorker.VRAMFreeGiB = floatPtr(16)
+
+		acceptWorker := desktopWorker
+		acceptWorker.WorkerID = "accept-worker"
+		acceptWorker.URL = acceptServer.URL
+		acceptWorker.VRAMFreeGiB = floatPtr(14)
+
+		testSafeWorkerMap := SafeWorkerMap{
+			workerMap: map[string]Worker{
+				rejectWorker.WorkerID: rejectWorker,
+				acceptWorker.WorkerID: acceptWorker,
+			},
+		}
+
+		recorder := httptest.NewRecorder()
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/schedule",
+			strings.NewReader(`{"required_vram_gib":4}`),
+		)
+
+		testSafeWorkerMap.ScheduleWorker(recorder, req)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("got status %v, expected 200", recorder.Code)
+		}
+
+		id1 := <-firstJobID
+		id2 := <-secondJobID
+
+		if id1 != id2 {
+			t.Fatalf("job IDs differ: first=%v second=%v", id1, id2)
+		}
+
+		var response ScheduleResponse
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+
+		if response.JobID != id1 {
+			t.Fatalf("response job ID %v differs from dispatched ID %v", response.JobID, id1)
+		}
+
+		if response.Worker.WorkerID != acceptWorker.WorkerID {
+			t.Fatalf(
+				"got worker %v, expected %v",
+				response.Worker.WorkerID,
+				acceptWorker.WorkerID,
+			)
+		}
+	})
 }
