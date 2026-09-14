@@ -10,6 +10,8 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -21,6 +23,70 @@ const bytesPerGiB = (1 << 30)
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
+}
+
+type Worker struct {
+	jobToPromptMap SafeJobToPromptMap
+}
+
+type PromptStatus int
+
+const (
+	StatusCompleted PromptStatus = iota // 0
+	StatusAccepted                      // 1
+	StatusRunning                       // 2
+	StatusPending                       // 3
+	StatusUnknown                       // 4
+)
+
+// String implements the fmt.Stringer interface
+func (s PromptStatus) String() string {
+	switch s {
+	case StatusCompleted:
+		return "completed"
+	case StatusAccepted:
+		return "accepted"
+	case StatusRunning:
+		return "running"
+	case StatusPending:
+		return "pending"
+	default:
+		return "unknown"
+	}
+}
+
+type HistoryResponse map[string]HistoryEntry
+
+type HistoryEntry struct {
+	Outputs map[string]OutputNode `json:"outputs"`
+	Status  HistoryStatus         `json:"status"`
+}
+
+type OutputNode struct {
+	Images []ComfyImage `json:"images"`
+}
+
+type ComfyImage struct {
+	Filename  string `json:"filename"`
+	Subfolder string `json:"subfolder"`
+	Type      string `json:"type"`
+}
+
+type HistoryStatus struct {
+	StatusStr string `json:"status_str"`
+	Completed bool   `json:"completed"`
+}
+
+type QueueObject [][]any
+
+type QueueResponse struct {
+	QueueRunning QueueObject `json:"queue_running"`
+	QueuePending QueueObject `json:"queue_pending"`
+}
+
+type SafeJobToPromptMap struct {
+	mu     sync.RWMutex
+	j2pMap map[string]string
 }
 
 type HealthResponse struct {
@@ -57,6 +123,10 @@ type PromptComfyUIResponse struct {
 	NodeErrors map[string]any `json:"node_errors"`
 }
 
+type GetJobStatusResponse struct {
+	Status string `json:"status"`
+}
+
 type ComfyUISystemStats struct {
 	Devices []Device `json:"devices"`
 }
@@ -82,6 +152,24 @@ func handleJSONErrorInternal(w http.ResponseWriter, err error) {
 func handleJSONErrorExternal(w http.ResponseWriter, err error) {
 	log.Printf("Error while handling JSON: %s\n", err)
 	http.Error(w, "Bad Request Error", http.StatusBadRequest)
+}
+
+func (m *SafeJobToPromptMap) Get(jobID string) (promptID string, exists bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	promptID, exists = m.j2pMap[jobID]
+	return promptID, exists
+}
+
+func (m *SafeJobToPromptMap) Put(jobID string, promptID string) (exists bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, exists = m.j2pMap[jobID]
+	m.j2pMap[jobID] = promptID
+
+	return exists
 }
 
 func registerToControlPlane() {
@@ -226,7 +314,7 @@ func capabilities(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func receiveJob(w http.ResponseWriter, req *http.Request) {
+func (worker *Worker) receiveJob(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var jobRequest ReceiveJobRequest
@@ -259,6 +347,9 @@ func receiveJob(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Got empty prompt_id from ComfyUI.", http.StatusInternalServerError)
 		return
 	}
+
+	j2pMap := &worker.jobToPromptMap
+	j2pMap.Put(jobRequest.JobID, promptResponse.PromptID)
 
 	jobResponse := ReceiveJobResponse{
 		JobID:    jobRequest.JobID,
@@ -322,6 +413,150 @@ func sendPromptToComfyUI(prompt map[string]any) (PromptComfyUIResponse, error) {
 	return promptResponse, nil
 }
 
+func getHistoryFromComfyUI(promptID string) *HistoryEntry {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, myEnv["COMFYUI_URL"]+"/history/"+promptID, nil)
+	if err != nil {
+		log.Printf("Failed to create history GET request: %v\n", err)
+		return nil
+	}
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("Could not connect to ComfyUI. %v\n", err)
+		return nil
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("API returned bad status code. %d\n", resp.StatusCode)
+		return nil
+	}
+
+	var historyResponse HistoryResponse
+	err = json.NewDecoder(resp.Body).Decode(&historyResponse)
+	if err != nil {
+		log.Printf("Unable to parse history response returned by ComfyUI. %v\n", err)
+		return nil
+	}
+
+	historyEntry, exists := historyResponse[promptID]
+	if !exists {
+		log.Printf("Unable to find promptID %v in history response returned by ComfyUI.\n", promptID)
+		return nil
+	}
+	return &historyEntry
+}
+
+func (queueObj QueueObject) toPromptIDList() (promptIDs []string) {
+	for _, val := range queueObj {
+		promptID, exists := val[1].(string)
+		if !exists || promptID == "" {
+			log.Println("Expected promptID to be in index 1 of queue object.")
+			continue
+		}
+		promptIDs = append(promptIDs, promptID)
+	}
+
+	return promptIDs
+}
+
+func getQueuesFromComfyUI() (queueRunning []string, queuePending []string, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, myEnv["COMFYUI_URL"]+"/queue", nil)
+	if err != nil {
+		log.Printf("Failed to create queue GET request: %v\n", err)
+		return nil, nil, false
+	}
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("Could not connect to ComfyUI. %v\n", err)
+		return nil, nil, false
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("API returned bad status code. %d\n", resp.StatusCode)
+		return nil, nil, false
+	}
+
+	var queueResponse QueueResponse
+	err = json.NewDecoder(resp.Body).Decode(&queueResponse)
+	if err != nil {
+		log.Printf("Unable to parse queue response returned by ComfyUI. %v\n", err)
+		return nil, nil, false
+	}
+
+	queueRunning = queueResponse.QueueRunning.toPromptIDList()
+	queuePending = queueResponse.QueuePending.toPromptIDList()
+
+	return queueRunning, queuePending, true
+}
+
+func getPromptStatusFromComfyUI(promptID string) PromptStatus {
+	historyEntry := getHistoryFromComfyUI(promptID)
+	if historyEntry != nil {
+		if historyEntry.Status.Completed {
+			return StatusCompleted
+		} else {
+			return StatusUnknown
+		}
+	}
+
+	queueRunning, queuePending, ok := getQueuesFromComfyUI()
+	if !ok {
+		log.Println("Unable to get queues from ComfyUI.")
+		return StatusUnknown
+	}
+
+	if slices.Contains(queueRunning, promptID) {
+		return StatusRunning
+	} else if slices.Contains(queuePending, promptID) {
+		return StatusPending
+	} else {
+		return StatusUnknown
+	}
+}
+
+func (worker *Worker) getJobStatus(w http.ResponseWriter, req *http.Request) {
+	j2pMap := &worker.jobToPromptMap
+	w.Header().Set("Content-Type", "application/json")
+
+	jobID := req.PathValue("id")
+
+	if jobID == "" {
+		log.Println("Unable to process GetJobStatusRequest with empty job_id.")
+		http.Error(w, "Cannot process GetJobStatusRequest with empty job_id.", http.StatusBadRequest)
+		return
+	}
+
+	promptID, exists := j2pMap.Get(jobID)
+	if !exists {
+		log.Printf("Cannot find existing job with job_id %v.\n", jobID)
+		http.Error(w, fmt.Sprintf("Cannot find existing job with job_id %v.", jobID), http.StatusNotFound)
+		return
+	}
+
+	promptStatus := getPromptStatusFromComfyUI(promptID)
+
+	resp := GetJobStatusResponse{
+		Status: promptStatus.String(),
+	}
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Failed encoding GetJobStatusResponse %v. %v\n", resp, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
 func readAndValidateEnvValues() {
 	var err error
 	myEnv, err = godotenv.Read()
@@ -359,11 +594,18 @@ func main() {
 
 	readAndValidateEnvValues()
 
+	worker := Worker{
+		jobToPromptMap: SafeJobToPromptMap{
+			j2pMap: make(map[string]string),
+		},
+	}
+
 	go registerToControlPlaneHeartbeat()
 
 	http.HandleFunc("GET /health", health)
 	http.HandleFunc("GET /capabilities", capabilities)
-	http.HandleFunc("POST /jobs", receiveJob)
+	http.HandleFunc("GET /jobs/{id}", worker.getJobStatus)
+	http.HandleFunc("POST /jobs", worker.receiveJob)
 
 	err := http.ListenAndServe(":"+myEnv["WORKER_PORT"], nil)
 	if err != nil {

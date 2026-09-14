@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"maps"
 	"net/http"
@@ -49,6 +50,24 @@ type Job struct {
 	Prompt map[string]any `json:"prompt"`
 }
 
+type JobRecord struct {
+	JobID     string    `json:"job_id"`
+	PromptID  string    `json:"prompt_id"`
+	WorkerID  string    `json:"worker_id"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type SafeJobRecordMap struct {
+	mu           sync.RWMutex
+	jobRecordMap map[string]JobRecord
+}
+
+type ControlPlane struct {
+	workerMap    SafeWorkerMap
+	jobRecordMap SafeJobRecordMap
+}
+
 type ListWorkersResponse struct {
 	Workers []WorkerStatus `json:"workers"`
 }
@@ -70,8 +89,66 @@ type SendJobResponse struct {
 	Status   string `json:"status"`
 }
 
+type GetJobStatusResponse struct {
+	Status string `json:"status"`
+}
+
 func (w Worker) IsOnline() bool {
 	return time.Since(w.LastSeen) < offlineTime
+}
+
+func (w Worker) GetJobStatus(jobID string) (jobStatus string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, w.URL+"/jobs/"+jobID, nil)
+	if err != nil {
+		log.Printf("Failed to create jobs GET request with %v: %v\n", jobID, err)
+		return jobStatus, fmt.Errorf("failed to create jobs GET request with %v: %w", jobID, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("Failed to GET jobs for worker %v, job_id %v. %v\n", w.WorkerID, jobID, err)
+		return jobStatus, fmt.Errorf("failed to GET jobs for worker %v, job_id %v. %w", w.WorkerID, jobID, err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Worker %v did not return good status code. Status: %v.\n", w.WorkerID, resp.StatusCode)
+		return jobStatus, fmt.Errorf("worker %v did not return good status code. Status: %v.\n", w.WorkerID, resp.StatusCode)
+	}
+
+	var getJobStatusResp GetJobStatusResponse
+	if err = json.NewDecoder(resp.Body).Decode(&getJobStatusResp); err != nil {
+		log.Printf("Failed to decode GetJobStatus response. %v\n", err)
+		return jobStatus, fmt.Errorf("failed to decode GetJobStatus response: %w", err)
+	}
+
+	return getJobStatusResp.Status, nil
+}
+
+func (jMap *SafeJobRecordMap) Get(jobID string) (JobRecord, bool) {
+	jMap.mu.RLock()
+	defer jMap.mu.RUnlock()
+
+	jobRecord, exists := jMap.jobRecordMap[jobID]
+	if !exists {
+		return JobRecord{}, false
+	}
+	return jobRecord, true
+}
+
+func (jMap *SafeJobRecordMap) Put(jobRecord JobRecord) (recordExists bool) {
+	jMap.mu.Lock()
+	defer jMap.mu.Unlock()
+
+	_, recordExists = jMap.jobRecordMap[jobRecord.JobID]
+	jMap.jobRecordMap[jobRecord.JobID] = jobRecord
+
+	return recordExists
 }
 
 func (wMap *SafeWorkerMap) Get(workerID string) (Worker, bool) {
@@ -95,7 +172,8 @@ func (wMap *SafeWorkerMap) Put(worker Worker) (workerExists bool) {
 	return workerExists
 }
 
-func (wMap *SafeWorkerMap) GetWorker(w http.ResponseWriter, req *http.Request) {
+func (cp *ControlPlane) GetWorker(w http.ResponseWriter, req *http.Request) {
+	wMap := &cp.workerMap
 	w.Header().Set("Content-Type", "application/json")
 
 	workerID := req.PathValue("id")
@@ -119,7 +197,8 @@ func (wMap *SafeWorkerMap) GetWorker(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (wMap *SafeWorkerMap) ListWorkers(w http.ResponseWriter, req *http.Request) {
+func (cp *ControlPlane) ListWorkers(w http.ResponseWriter, req *http.Request) {
+	wMap := &cp.workerMap
 	w.Header().Set("Content-Type", "application/json")
 	wMap.mu.RLock()
 	workers := slices.Collect(maps.Values(wMap.workerMap))
@@ -150,7 +229,8 @@ func (wMap *SafeWorkerMap) ListWorkers(w http.ResponseWriter, req *http.Request)
 	}
 }
 
-func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Request) {
+func (cp *ControlPlane) RegisterWorker(w http.ResponseWriter, req *http.Request) {
+	wMap := &cp.workerMap
 	var newWorker Worker
 	err := json.NewDecoder(req.Body).Decode(&newWorker)
 	if err != nil {
@@ -175,7 +255,8 @@ func (wMap *SafeWorkerMap) RegisterWorker(w http.ResponseWriter, req *http.Reque
 	}
 }
 
-func (wMap *SafeWorkerMap) eligibleWorkers(requiredVRAM float64) []Worker {
+func (cp *ControlPlane) eligibleWorkers(requiredVRAM float64) []Worker {
+	wMap := &cp.workerMap
 	wMap.mu.RLock()
 	defer wMap.mu.RUnlock()
 	var eligibleWorkers []Worker
@@ -212,14 +293,11 @@ func (worker Worker) SendJob(job Job) string {
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, worker.URL+"/jobs", bytes.NewReader(jobJson))
 	if err != nil {
-		log.Printf("Failed to create HTTP send job request.%v\n", err)
-		return ""
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if err != nil {
 		log.Printf("Failed to create jobs POST request with %v: %v\n", jobJson, err)
 		return ""
 	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		log.Printf("Failed to POST jobs for worker %v. %v\n", worker.WorkerID, err)
@@ -253,7 +331,7 @@ func (worker Worker) SendJob(job Job) string {
 	return sendJobResp.PromptID
 }
 
-func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Request) {
+func (cp *ControlPlane) ScheduleWorker(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var scheduleReq ScheduleRequest
 	err := json.NewDecoder(req.Body).Decode(&scheduleReq)
@@ -269,7 +347,13 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	eligibleWorkers := wMap.eligibleWorkers(scheduleReq.RequiredVRAMGiB)
+	if len(scheduleReq.Prompt) == 0 {
+		log.Println("Unable to process Schedule request with empty prompt.")
+		http.Error(w, "Prompt must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	eligibleWorkers := cp.eligibleWorkers(scheduleReq.RequiredVRAMGiB)
 	if len(eligibleWorkers) == 0 {
 		log.Printf("Unable to find available worker for requested free VRAM %v", scheduleReq.RequiredVRAMGiB)
 		http.Error(w, "Unable to find available worker.", http.StatusServiceUnavailable)
@@ -298,6 +382,16 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	jobRecord := JobRecord{
+		JobID:     job.ID,
+		PromptID:  promptID,
+		WorkerID:  chosenWorker.WorkerID,
+		Status:    "accepted",
+		CreatedAt: time.Now(),
+	}
+
+	cp.jobRecordMap.Put(jobRecord)
+
 	resp := ScheduleResponse{
 		JobID:    job.ID,
 		PromptID: promptID,
@@ -307,6 +401,43 @@ func (wMap *SafeWorkerMap) ScheduleWorker(w http.ResponseWriter, req *http.Reque
 	err = json.NewEncoder(w).Encode(resp)
 	if err != nil {
 		log.Printf("Unable to encode Schedule response to JSON. %v\n", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (cp *ControlPlane) GetJobRecord(w http.ResponseWriter, req *http.Request) {
+	wMap := &cp.workerMap
+	jMap := &cp.jobRecordMap
+	w.Header().Set("Content-Type", "application/json")
+
+	jobID := req.PathValue("id")
+	jobRecord, exists := jMap.Get(jobID)
+
+	if !exists {
+		http.Error(w, "404 Not Found", http.StatusNotFound)
+		return
+	}
+
+	worker, exists := wMap.Get(jobRecord.WorkerID)
+	if !exists {
+		log.Printf("JobRecord for job_id %v exists, but no corresponding worker found.", jobID)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	jobStatus, err := worker.GetJobStatus(jobID)
+	if err != nil {
+		log.Printf("Failed to get job status for worker %v, job_id %v. %v\n", worker.WorkerID, jobID, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	jobRecord.Status = jobStatus
+	jMap.Put(jobRecord)
+
+	err = json.NewEncoder(w).Encode(jobRecord)
+	if err != nil {
+		log.Printf("Unable to encode JobRecord to JSON. %v\n", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -330,14 +461,20 @@ func readAndValidateEnvValues() {
 func main() {
 	readAndValidateEnvValues()
 
-	safeWorkerMap := SafeWorkerMap{
-		workerMap: make(map[string]Worker),
+	controlPlane := ControlPlane{
+		workerMap: SafeWorkerMap{
+			workerMap: make(map[string]Worker),
+		},
+		jobRecordMap: SafeJobRecordMap{
+			jobRecordMap: make(map[string]JobRecord),
+		},
 	}
 
-	http.HandleFunc("GET /workers", safeWorkerMap.ListWorkers)
-	http.HandleFunc("GET /workers/{id}", safeWorkerMap.GetWorker)
-	http.HandleFunc("POST /workers/register", safeWorkerMap.RegisterWorker)
-	http.HandleFunc("POST /schedule", safeWorkerMap.ScheduleWorker)
+	http.HandleFunc("GET /workers", controlPlane.ListWorkers)
+	http.HandleFunc("GET /workers/{id}", controlPlane.GetWorker)
+	http.HandleFunc("GET /jobs/{id}", controlPlane.GetJobRecord)
+	http.HandleFunc("POST /workers/register", controlPlane.RegisterWorker)
+	http.HandleFunc("POST /schedule", controlPlane.ScheduleWorker)
 
 	err := http.ListenAndServe(":"+myEnv["CONTROL_PLANE_PORT"], nil)
 	if err != nil {
