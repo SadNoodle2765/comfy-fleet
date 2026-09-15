@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"sync"
@@ -542,6 +543,41 @@ func getImageMetadataFromComfyUI(promptID string) (image ComfyImage, err error) 
 	return image, fmt.Errorf("could not get image from history response from ComfyUI for prompt_id %v. %v", promptID, history.Outputs)
 }
 
+func getImageFromComfyUI(ctx context.Context, promptID string) (resp *http.Response, err error) {
+	imageMetadata, err := getImageMetadataFromComfyUI(promptID)
+	if err != nil {
+		return resp, fmt.Errorf("failed getting image metadata for promptID %v. %w", promptID, err)
+	}
+
+	u, err := url.Parse(myEnv["COMFYUI_URL"] + "/view")
+	if err != nil {
+		return resp, fmt.Errorf("failed parsing URL. %w", err)
+	}
+
+	q := u.Query()
+	q.Add("filename", imageMetadata.Filename)
+	q.Add("subfolder", imageMetadata.Subfolder)
+	q.Add("type", imageMetadata.Type)
+	u.RawQuery = q.Encode()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return resp, fmt.Errorf("failed to create view GET request: %w", err)
+	}
+
+	resp, err = httpClient.Do(httpReq)
+	if err != nil {
+		return resp, fmt.Errorf("could not connect to ComfyUI. %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return resp, fmt.Errorf("ComfyUI returned bad status code. %d", resp.StatusCode)
+	}
+
+	return resp, nil
+}
+
 func (worker *Worker) getJob(w http.ResponseWriter, req *http.Request) {
 	j2pMap := &worker.jobToPromptMap
 	w.Header().Set("Content-Type", "application/json")
@@ -582,6 +618,45 @@ func (worker *Worker) getJob(w http.ResponseWriter, req *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Failed encoding GetJobResponse %v. %v\n", resp, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (worker *Worker) getImage(w http.ResponseWriter, req *http.Request) {
+	j2pMap := &worker.jobToPromptMap
+	jobID := req.PathValue("id")
+
+	if jobID == "" {
+		log.Println("Unable to process GetImageRequest with empty job_id.")
+		http.Error(w, "Cannot process GetImageRequest with empty job_id.", http.StatusBadRequest)
+		return
+	}
+
+	promptID, exists := j2pMap.Get(jobID)
+	if !exists {
+		log.Printf("Cannot find existing job with job_id %v.\n", jobID)
+		http.Error(w, fmt.Sprintf("Cannot find existing job with job_id %v.", jobID), http.StatusNotFound)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	defer cancel()
+
+	resp, err := getImageFromComfyUI(ctx, promptID)
+
+	if err != nil {
+		log.Printf("Failed getting image from ComfyUI for prompt_id %v. %v", promptID, err)
+		http.Error(w, "Failed getting image from ComfyUI.", http.StatusInternalServerError)
+		return
+	}
+
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("Failed to stream image for prompt_id %v. %v", promptID, err)
+		http.Error(w, "Failed to stream image from ComfyUI.", http.StatusInternalServerError)
 		return
 	}
 }
@@ -634,6 +709,7 @@ func main() {
 	http.HandleFunc("GET /health", health)
 	http.HandleFunc("GET /capabilities", capabilities)
 	http.HandleFunc("GET /jobs/{id}", worker.getJob)
+	http.HandleFunc("GET /jobs/{id}/image", worker.getImage)
 	http.HandleFunc("POST /jobs", worker.receiveJob)
 
 	err := http.ListenAndServe(":"+myEnv["WORKER_PORT"], nil)

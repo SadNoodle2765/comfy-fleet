@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"net/http"
@@ -115,7 +116,6 @@ func (w Worker) GetJob(jobID string) (jobResp GetJobResponse, err error) {
 		log.Printf("Failed to create jobs GET request with %v: %v\n", jobID, err)
 		return jobResp, fmt.Errorf("failed to create jobs GET request with %v: %w", jobID, err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -136,6 +136,25 @@ func (w Worker) GetJob(jobID string) (jobResp GetJobResponse, err error) {
 	}
 
 	return jobResp, nil
+}
+
+func (w Worker) GetImage(ctx context.Context, jobID string) (resp *http.Response, err error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, w.URL+"/jobs/"+jobID+"/image", nil)
+	if err != nil {
+		return resp, fmt.Errorf("failed to create image GET request with %v: %w", jobID, err)
+	}
+
+	resp, err = httpClient.Do(httpReq)
+	if err != nil {
+		return resp, fmt.Errorf("failed to GET image for worker %v, job_id %v. %w", w.WorkerID, jobID, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return resp, fmt.Errorf("worker %v did not return good status code. Status: %v.", w.WorkerID, resp.StatusCode)
+	}
+
+	return resp, nil
 }
 
 func (jMap *SafeJobRecordMap) Get(jobID string) (JobRecord, bool) {
@@ -452,6 +471,42 @@ func (cp *ControlPlane) GetJobRecord(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (cp *ControlPlane) GetJobImage(w http.ResponseWriter, req *http.Request) {
+	wMap := &cp.workerMap
+	jMap := &cp.jobRecordMap
+
+	jobID := req.PathValue("id")
+	jobRecord, exists := jMap.Get(jobID)
+
+	if !exists {
+		http.Error(w, "404 Not Found", http.StatusNotFound)
+		return
+	}
+
+	worker, exists := wMap.Get(jobRecord.WorkerID)
+	if !exists {
+		log.Printf("JobRecord for job_id %v exists, but no corresponding worker found.", jobID)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	imageResp, err := worker.GetImage(req.Context(), jobID)
+	if err != nil {
+		log.Printf("Failed to get image from worker %v, job_id %v. %v\n", worker.WorkerID, jobID, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	defer imageResp.Body.Close()
+
+	w.Header().Set("Content-Type", imageResp.Header.Get("Content-Type"))
+	_, err = io.Copy(w, imageResp.Body)
+	if err != nil {
+		log.Printf("Failed to stream image from worker %v with job_id %v. %v\n", worker.WorkerID, jobID, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
 func readAndValidateEnvValues() {
 	var err error
 	myEnv, err = godotenv.Read()
@@ -482,6 +537,7 @@ func main() {
 	http.HandleFunc("GET /workers", controlPlane.ListWorkers)
 	http.HandleFunc("GET /workers/{id}", controlPlane.GetWorker)
 	http.HandleFunc("GET /jobs/{id}", controlPlane.GetJobRecord)
+	http.HandleFunc("GET /jobs/{id}/image", controlPlane.GetJobImage)
 	http.HandleFunc("POST /workers/register", controlPlane.RegisterWorker)
 	http.HandleFunc("POST /schedule", controlPlane.ScheduleWorker)
 
