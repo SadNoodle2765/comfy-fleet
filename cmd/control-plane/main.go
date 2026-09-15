@@ -51,11 +51,12 @@ type Job struct {
 }
 
 type JobRecord struct {
-	JobID     string    `json:"job_id"`
-	PromptID  string    `json:"prompt_id"`
-	WorkerID  string    `json:"worker_id"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
+	JobID     string         `json:"job_id"`
+	PromptID  string         `json:"prompt_id"`
+	WorkerID  string         `json:"worker_id"`
+	Status    string         `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	Image     *ImageMetadata `json:"image"`
 }
 
 type SafeJobRecordMap struct {
@@ -89,45 +90,52 @@ type SendJobResponse struct {
 	Status   string `json:"status"`
 }
 
-type GetJobStatusResponse struct {
-	Status string `json:"status"`
+type GetJobResponse struct {
+	JobID  string         `json:"job_id"`
+	Status string         `json:"status"`
+	Image  *ImageMetadata `json:"image"`
+}
+
+type ImageMetadata struct {
+	Filename  string `json:"filename"`
+	Subfolder string `json:"subfolder"`
+	Type      string `json:"type"`
 }
 
 func (w Worker) IsOnline() bool {
 	return time.Since(w.LastSeen) < offlineTime
 }
 
-func (w Worker) GetJobStatus(jobID string) (jobStatus string, err error) {
+func (w Worker) GetJob(jobID string) (jobResp GetJobResponse, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, w.URL+"/jobs/"+jobID, nil)
 	if err != nil {
 		log.Printf("Failed to create jobs GET request with %v: %v\n", jobID, err)
-		return jobStatus, fmt.Errorf("failed to create jobs GET request with %v: %w", jobID, err)
+		return jobResp, fmt.Errorf("failed to create jobs GET request with %v: %w", jobID, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		log.Printf("Failed to GET jobs for worker %v, job_id %v. %v\n", w.WorkerID, jobID, err)
-		return jobStatus, fmt.Errorf("failed to GET jobs for worker %v, job_id %v. %w", w.WorkerID, jobID, err)
+		return jobResp, fmt.Errorf("failed to GET jobs for worker %v, job_id %v. %w", w.WorkerID, jobID, err)
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Worker %v did not return good status code. Status: %v.\n", w.WorkerID, resp.StatusCode)
-		return jobStatus, fmt.Errorf("worker %v did not return good status code. Status: %v.\n", w.WorkerID, resp.StatusCode)
+		return jobResp, fmt.Errorf("worker %v did not return good status code. Status: %v.\n", w.WorkerID, resp.StatusCode)
 	}
 
-	var getJobStatusResp GetJobStatusResponse
-	if err = json.NewDecoder(resp.Body).Decode(&getJobStatusResp); err != nil {
-		log.Printf("Failed to decode GetJobStatus response. %v\n", err)
-		return jobStatus, fmt.Errorf("failed to decode GetJobStatus response: %w", err)
+	if err = json.NewDecoder(resp.Body).Decode(&jobResp); err != nil {
+		log.Printf("Failed to decode GetJob response. %v\n", err)
+		return jobResp, fmt.Errorf("failed to decode GetJob response: %w", err)
 	}
 
-	return getJobStatusResp.Status, nil
+	return jobResp, nil
 }
 
 func (jMap *SafeJobRecordMap) Get(jobID string) (JobRecord, bool) {
@@ -425,14 +433,15 @@ func (cp *ControlPlane) GetJobRecord(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	jobStatus, err := worker.GetJobStatus(jobID)
+	jobResp, err := worker.GetJob(jobID)
 	if err != nil {
-		log.Printf("Failed to get job status for worker %v, job_id %v. %v\n", worker.WorkerID, jobID, err)
+		log.Printf("Failed to get job from worker %v, job_id %v. %v\n", worker.WorkerID, jobID, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	jobRecord.Status = jobStatus
+	jobRecord.Status = jobResp.Status
+	jobRecord.Image = jobResp.Image
 	jMap.Put(jobRecord)
 
 	err = json.NewEncoder(w).Encode(jobRecord)

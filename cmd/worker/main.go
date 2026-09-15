@@ -123,8 +123,10 @@ type PromptComfyUIResponse struct {
 	NodeErrors map[string]any `json:"node_errors"`
 }
 
-type GetJobStatusResponse struct {
-	Status string `json:"status"`
+type GetJobResponse struct {
+	JobID  string      `json:"job_id"`
+	Status string      `json:"status"`
+	Image  *ComfyImage `json:"image"`
 }
 
 type ComfyUISystemStats struct {
@@ -525,15 +527,30 @@ func getPromptStatusFromComfyUI(promptID string) PromptStatus {
 	}
 }
 
-func (worker *Worker) getJobStatus(w http.ResponseWriter, req *http.Request) {
+func getImageMetadataFromComfyUI(promptID string) (image ComfyImage, err error) {
+	history := getHistoryFromComfyUI(promptID)
+	if history == nil {
+		return image, fmt.Errorf("could not get history from ComfyUI with prompt_id %v.", promptID)
+	}
+
+	for _, node := range history.Outputs {
+		if len(node.Images) > 0 {
+			return node.Images[0], nil
+		}
+	}
+
+	return image, fmt.Errorf("could not get image from history response from ComfyUI for prompt_id %v. %v", promptID, history.Outputs)
+}
+
+func (worker *Worker) getJob(w http.ResponseWriter, req *http.Request) {
 	j2pMap := &worker.jobToPromptMap
 	w.Header().Set("Content-Type", "application/json")
 
 	jobID := req.PathValue("id")
 
 	if jobID == "" {
-		log.Println("Unable to process GetJobStatusRequest with empty job_id.")
-		http.Error(w, "Cannot process GetJobStatusRequest with empty job_id.", http.StatusBadRequest)
+		log.Println("Unable to process GetJobRequest with empty job_id.")
+		http.Error(w, "Cannot process GetJobRequest with empty job_id.", http.StatusBadRequest)
 		return
 	}
 
@@ -544,14 +561,26 @@ func (worker *Worker) getJobStatus(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	var imagePointer *ComfyImage
 	promptStatus := getPromptStatusFromComfyUI(promptID)
+	if promptStatus == StatusCompleted {
+		image, err := getImageMetadataFromComfyUI(promptID)
+		if err != nil {
+			log.Printf("Failed to get image metadata with completed status for prompt_id %v. %v", promptID, err)
+			http.Error(w, fmt.Sprintf("Failed getting image metadata for job_id %v with completed status.", jobID), http.StatusInternalServerError)
+			return
+		}
+		imagePointer = &image
+	}
 
-	resp := GetJobStatusResponse{
+	resp := GetJobResponse{
+		JobID:  jobID,
 		Status: promptStatus.String(),
+		Image:  imagePointer,
 	}
 
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Failed encoding GetJobStatusResponse %v. %v\n", resp, err)
+		log.Printf("Failed encoding GetJobResponse %v. %v\n", resp, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -604,7 +633,7 @@ func main() {
 
 	http.HandleFunc("GET /health", health)
 	http.HandleFunc("GET /capabilities", capabilities)
-	http.HandleFunc("GET /jobs/{id}", worker.getJobStatus)
+	http.HandleFunc("GET /jobs/{id}", worker.getJob)
 	http.HandleFunc("POST /jobs", worker.receiveJob)
 
 	err := http.ListenAndServe(":"+myEnv["WORKER_PORT"], nil)
