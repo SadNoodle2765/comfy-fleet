@@ -1,10 +1,14 @@
-.PHONY: worker-windows deploy-worker stop-worker
+.PHONY: worker-windows deploy-worker-laptop deploy-worker deploy-workers stop-worker stop-worker-laptop stop-workers clear-worker-logs
 
 DESKTOP_WINDOWS_HOST := arceu@shigures-pc
+LAPTOP_WINDOWS_HOST := arceu@shigurerazer
+
 DESKTOP_WINDOWS_DIR := C:\Projects\comfy-fleet-worker
+LAPTOP_WINDOWS_DIR := C:\Projects\comfy-fleet-worker
+
 WORKER_TASK := ComfyFleetWorker
 
-VRAM ?= 7
+VRAM ?= 1
 WORKFLOW ?= prompts/animagine.json
 POS ?= 1girl, shameimaru aya (newsboy), touhou, glaring, clenched teeth, shaded face, cowboy shot, looking at viewer, masterpiece, high score, great score, absurdres
 NEG ?= lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry, necklace
@@ -19,16 +23,32 @@ worker-windows:
 	GOOS=windows GOARCH=amd64 go build -o bin/worker.exe ./cmd/worker
 
 deploy-worker: worker-windows
-	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Stop-ScheduledTask -TaskName $(WORKER_TASK) -ErrorAction SilentlyContinue"'
+	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Stop-ScheduledTask -TaskName $(WORKER_TASK) -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; $$p = Get-Process worker -ErrorAction SilentlyContinue; if ($$p) { $$p | Stop-Process -Force }; exit 0"'
 	scp bin/worker.exe $(DESKTOP_WINDOWS_HOST):worker.exe.new
 	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Move-Item -Force $$HOME\worker.exe.new $(DESKTOP_WINDOWS_DIR)\worker.exe"'
 	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Start-ScheduledTask -TaskName $(WORKER_TASK)"'
 
+deploy-worker-laptop: worker-windows
+	ssh $(LAPTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Stop-ScheduledTask -TaskName $(WORKER_TASK) -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; $$p = Get-Process worker -ErrorAction SilentlyContinue; if ($$p) { $$p | Stop-Process -Force }; exit 0"'
+	scp bin/worker.exe $(LAPTOP_WINDOWS_HOST):worker.exe.new
+	ssh $(LAPTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Move-Item -Force $$HOME\worker.exe.new $(LAPTOP_WINDOWS_DIR)\worker.exe"'
+	ssh $(LAPTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Start-ScheduledTask -TaskName $(WORKER_TASK)"'
+
+deploy-workers: deploy-worker deploy-worker-laptop
+
 stop-worker:
 	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Stop-ScheduledTask -TaskName $(WORKER_TASK) -ErrorAction SilentlyContinue; Stop-Process -Name worker -Force -ErrorAction SilentlyContinue"'
 
+stop-worker-laptop:
+	ssh $(LAPTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Stop-ScheduledTask -TaskName $(WORKER_TASK) -ErrorAction SilentlyContinue"'
+
+stop-workers: stop-worker stop-worker-laptop
+
 worker-logs:
 	ssh $(DESKTOP_WINDOWS_HOST) 'powershell -NoProfile -Command "Get-Content $(DESKTOP_WINDOWS_DIR)\worker.log -Wait"'
+
+clear-worker-logs:
+	ssh $(DESKTOP_WINDOWS_HOST) "powershell -NoProfile -Command \"if (Test-Path '$(DESKTOP_WINDOWS_DIR)\worker.log') { Clear-Content '$(DESKTOP_WINDOWS_DIR)\worker.log' }\""
 
 schedule-animagine:
 	jq \
